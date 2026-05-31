@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Motion Tracker</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0d0d0d;
+  color: #e0e0e0;
+  font-family: 'Courier New', monospace;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-height: 100vh;
+  padding: 16px;
+}
+h1 { font-size: 18px; letter-spacing: 4px; color: #00ff88; margin-bottom: 12px; text-transform: uppercase; }
+#main { position: relative; display: inline-block; }
+video { display: block; width: 640px; max-width: 100vw; border: 1px solid #222; background: #000; }
+#overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+#controls {
+  display: flex; gap: 12px; flex-wrap: wrap; align-items: center;
+  margin: 12px 0; justify-content: center;
+}
+button {
+  background: transparent; color: #00ff88; border: 1px solid #00ff88;
+  padding: 8px 20px; font-family: 'Courier New', monospace; font-size: 12px;
+  letter-spacing: 2px; cursor: pointer; text-transform: uppercase;
+}
+button:hover { background: #00ff8822; }
+button.active { background: #00ff8833; }
+button.danger { color: #ff4444; border-color: #ff4444; }
+button.danger:hover { background: #ff444422; }
+#stats {
+  display: flex; gap: 24px; font-size: 11px; color: #666; letter-spacing: 1px;
+  margin-bottom: 8px;
+}
+.stat-val { color: #00ff88; font-weight: bold; }
+#sensitivity-wrap { display: flex; align-items: center; gap: 10px; font-size: 11px; color: #666; letter-spacing: 1px; }
+input[type=range] { width: 100px; accent-color: #00ff88; }
+#log {
+  width: 640px; max-width: 100vw; height: 80px; overflow-y: auto;
+  background: #0a0a0a; border: 1px solid #1a1a1a; padding: 6px 10px;
+  font-size: 10px; color: #444; margin-top: 8px;
+}
+#log p { margin: 1px 0; }
+#log p.new { color: #00ff88; }
+#startscreen {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,.9);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+}
+#startscreen p { font-size: 12px; color: #555; letter-spacing: 2px; text-align: center; line-height: 1.8; }
+.tag {
+  display: inline-block; font-size: 9px; letter-spacing: 1px;
+  padding: 2px 6px; border-radius: 2px; vertical-align: middle;
+}
+.tag-move { background: #00ff8822; color: #00ff88; border: 1px solid #00ff8866; }
+.tag-new { background: #ff880022; color: #ff8800; border: 1px solid #ff880066; }
+</style>
+</head>
+<body>
+<h1>Motion Tracker</h1>
+<div id="stats">
+  <span>Objects: <span class="stat-val" id="obj-count">0</span></span>
+  <span>FPS: <span class="stat-val" id="fps-val">0</span></span>
+  <span>Sensitivity: <span class="stat-val" id="sens-label">50</span></span>
+  <span>Mode: <span class="stat-val" id="mode-label">BOX</span></span>
+</div>
+<div id="controls">
+  <button id="btn-start">Start Camera</button>
+  <button id="btn-pause">Pause</button>
+  <button id="btn-mode">Mode: Box</button>
+  <button id="btn-trails" class="active">Trails: On</button>
+  <button id="btn-reset" class="danger">Reset</button>
+  <div id="sensitivity-wrap">
+    Sensitivity
+    <input type="range" id="sens" min="5" max="100" value="50">
+  </div>
+</div>
+<div id="main">
+  <video id="video" autoplay muted playsinline width="640" height="480"></video>
+  <canvas id="overlay" width="640" height="480"></canvas>
+  <div id="startscreen">
+    <p>MOTION TRACKER<br><br>
+    Detects and marks moving objects in real time<br>
+    using background subtraction frame diffing<br><br>
+    <span class="tag tag-move">MOVING</span> boxes track active motion &nbsp;
+    <span class="tag tag-new">NEW</span> flags appear on entry</p>
+    <button id="btn-start2" style="font-size:14px;padding:12px 36px">Grant Camera Access</button>
+  </div>
+</div>
+<div id="log"><p>— system ready —</p></div>
+
+<script>
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const log = document.getElementById('log');
+const W = 640, H = 480;
+
+let running = false, paused = false;
+let prevFrame = null, diffCanvas, diffCtx;
+let mode = 'box'; // box | dot | heatmap
+let showTrails = true;
+let sensitivity = 50;
+let animFrame;
+let fpsArr = [], lastFpsTime = performance.now(), framesSinceCheck = 0;
+let trackedObjects = [];
+let objectIdCounter = 0;
+let trailCanvas, trailCtx;
+let heatCanvas, heatCtx;
+
+function addLog(msg, isNew=false) {
+  const p = document.createElement('p');
+  p.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  if (isNew) p.className = 'new';
+  log.prepend(p);
+  while (log.children.length > 30) log.removeChild(log.lastChild);
+}
+
+function initCanvases() {
+  diffCanvas = document.createElement('canvas');
+  diffCanvas.width = W; diffCanvas.height = H;
+  diffCtx = diffCanvas.getContext('2d');
+
+  trailCanvas = document.createElement('canvas');
+  trailCanvas.width = W; trailCanvas.height = H;
+  trailCtx = trailCanvas.getContext('2d');
+
+  heatCanvas = document.createElement('canvas');
+  heatCanvas.width = W; heatCanvas.height = H;
+  heatCtx = heatCanvas.getContext('2d');
+}
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'environment' }
+    });
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    const vw = video.videoWidth, vh = video.videoHeight;
+    overlay.width = vw; overlay.height = vh;
+    video.width = vw; video.height = vh;
+    if (diffCanvas) { diffCanvas.width = vw; diffCanvas.height = H; }
+    initCanvases();
+    document.getElementById('startscreen').style.display = 'none';
+    running = true; paused = false;
+    addLog('Camera started', true);
+    loop();
+  } catch(e) {
+    addLog('Camera error: ' + e.message);
+    alert('Could not access camera: ' + e.message);
+  }
+}
+
+function getThreshold() { return Math.floor(255 * (sensitivity / 100) * 0.3 + 8); }
+
+function computeDiff(imageData) {
+  if (!prevFrame) { prevFrame = new Uint8ClampedArray(imageData.data); return null; }
+  const curr = imageData.data;
+  const prev = prevFrame;
+  const out = new Uint8ClampedArray(curr.length);
+  const thresh = getThreshold();
+  for (let i = 0; i < curr.length; i += 4) {
+    const dr = Math.abs(curr[i]   - prev[i]);
+    const dg = Math.abs(curr[i+1] - prev[i+1]);
+    const db = Math.abs(curr[i+2] - prev[i+2]);
+    const diff = (dr + dg + db) / 3;
+    const v = diff > thresh ? 255 : 0;
+    out[i] = out[i+1] = out[i+2] = v; out[i+3] = 255;
+  }
+  prevFrame = new Uint8ClampedArray(curr);
+  return out;
+}
+
+function erode(data, w, h) {
+  const out = new Uint8ClampedArray(data.length);
+  for (let y = 2; y < h-2; y++) {
+    for (let x = 2; x < w-2; x++) {
+      let sum = 0;
+      for (let dy=-2;dy<=2;dy++) for (let dx=-2;dx<=2;dx++) {
+        if (data[((y+dy)*w+(x+dx))*4] > 0) sum++;
+      }
+      if (sum > 8) { const i=(y*w+x)*4; out[i]=out[i+1]=out[i+2]=255; out[i+3]=255; }
+    }
+  }
+  return out;
+}
+
+function findBlobs(data, w, h) {
+  const visited = new Uint8Array(w*h);
+  const blobs = [];
+  const minArea = Math.max(80, (100 - sensitivity) * 8);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = y*w+x;
+      if (visited[idx] || data[idx*4] === 0) continue;
+      const stack = [[x,y]];
+      visited[idx] = 1;
+      let minX=x, maxX=x, minY=y, maxY=y, count=0;
+      while (stack.length) {
+        const [cx,cy] = stack.pop();
+        minX=Math.min(minX,cx);maxX=Math.max(maxX,cx);
+        minY=Math.min(minY,cy);maxY=Math.max(maxY,cy);
+        count++;
+        for (const [nx,ny] of [[cx-1,cy],[cx+1,cy],[cx,cy-1],[cx,cy+1]]) {
+          if (nx>=0&&nx<w&&ny>=0&&ny<h) {
+            const ni=ny*w+nx;
+            if (!visited[ni]&&data[ni*4]>0) { visited[ni]=1; stack.push([nx,ny]); }
+          }
+        }
+      }
+      if (count >= minArea) blobs.push({x:minX, y:minY, w:maxX-minX, h:maxY-minY, cx:(minX+maxX)/2, cy:(minY+maxY)/2, area:count});
+    }
+  }
+  return blobs.sort((a,b)=>b.area-a.area).slice(0,20);
+}
+
+function matchObjects(blobs) {
+  const maxDist = 100;
+  const now = Date.now();
+  const matched = new Set();
+
+  for (const b of blobs) {
+    let best = null, bestDist = maxDist;
+    for (const obj of trackedObjects) {
+      if (matched.has(obj.id)) continue;
+      const d = Math.hypot(b.cx - obj.cx, b.cy - obj.cy);
+      if (d < bestDist) { bestDist = d; best = obj; }
+    }
+    if (best) {
+      best.cx = b.cx; best.cy = b.cy;
+      best.x = b.x; best.y = b.y;
+      best.w = b.w; best.h = b.h;
+      best.area = b.area;
+      best.lastSeen = now;
+      best.isNew = false;
+      matched.add(best.id);
+      best.trail.push([b.cx, b.cy]);
+      if (best.trail.length > 40) best.trail.shift();
+    } else {
+      const id = ++objectIdCounter;
+      const newObj = { id, cx:b.cx, cy:b.cy, x:b.x, y:b.y, w:b.w, h:b.h, area:b.area, lastSeen:now, isNew:true, trail:[[b.cx,b.cy]] };
+      trackedObjects.push(newObj);
+      matched.add(id);
+      addLog(`Object #${id} detected at (${Math.round(b.cx)}, ${Math.round(b.cy)})`, true);
+    }
+  }
+  trackedObjects = trackedObjects.filter(o => now - o.lastSeen < 600);
+}
+
+function drawResults(blobs) {
+  const vw = overlay.width, vh = overlay.height;
+  ctx.clearRect(0,0,vw,vh);
+
+  if (showTrails) {
+    trailCtx.fillStyle = 'rgba(0,0,0,0.04)';
+    trailCtx.fillRect(0,0,vw,vh);
+  }
+
+  for (const obj of trackedObjects) {
+    const now = Date.now();
+    const age = Math.min(1, (now - obj.lastSeen + 600) / 600);
+    const alpha = 1 - age * 0.5;
+
+    if (mode === 'heatmap') {
+      heatCtx.fillStyle = `rgba(255,80,0,0.08)`;
+      heatCtx.beginPath();
+      heatCtx.arc(obj.cx, obj.cy, Math.sqrt(obj.area)*1.2, 0, Math.PI*2);
+      heatCtx.fill();
+    }
+
+    if (showTrails && obj.trail.length > 1) {
+      if (mode !== 'heatmap') {
+        ctx.strokeStyle = `rgba(0,255,136,0.35)`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(obj.trail[0][0], obj.trail[0][1]);
+        for (let i=1;i<obj.trail.length;i++) ctx.lineTo(obj.trail[i][0], obj.trail[i][1]);
+        ctx.stroke();
+      }
+    }
+
+    if (mode === 'box') {
+      const pad = 8;
+      ctx.strokeStyle = `rgba(0,255,136,${alpha})`;
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(obj.x - pad, obj.y - pad, obj.w + pad*2, obj.h + pad*2);
+      const cornerLen = 12;
+      ctx.strokeStyle = `rgba(0,255,136,1)`;
+      ctx.lineWidth = 2;
+      const bx = obj.x-pad, by = obj.y-pad, bw = obj.w+pad*2, bh = obj.h+pad*2;
+      ctx.beginPath();
+      ctx.moveTo(bx,by+cornerLen);ctx.lineTo(bx,by);ctx.lineTo(bx+cornerLen,by);
+      ctx.moveTo(bx+bw-cornerLen,by);ctx.lineTo(bx+bw,by);ctx.lineTo(bx+bw,by+cornerLen);
+      ctx.moveTo(bx+bw,by+bh-cornerLen);ctx.lineTo(bx+bw,by+bh);ctx.lineTo(bx+bw-cornerLen,by+bh);
+      ctx.moveTo(bx+cornerLen,by+bh);ctx.lineTo(bx,by+bh);ctx.lineTo(bx,by+bh-cornerLen);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(bx, by-16, 60, 15);
+      ctx.fillStyle = obj.isNew ? '#ff8800' : '#00ff88';
+      ctx.font = '9px Courier New';
+      ctx.fillText(`#${obj.id} ${obj.isNew?'NEW':'MOVE'}`, bx+3, by-5);
+
+    } else if (mode === 'dot') {
+      ctx.beginPath();
+      ctx.arc(obj.cx, obj.cy, 5, 0, Math.PI*2);
+      ctx.fillStyle = `rgba(0,255,136,${alpha})`;
+      ctx.fill();
+      const r = Math.sqrt(obj.area) * 1.5;
+      ctx.strokeStyle = `rgba(0,255,136,${alpha*0.5})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(obj.cx, obj.cy, r, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.fillStyle = obj.isNew ? '#ff8800' : '#00ff88';
+      ctx.font = '9px Courier New';
+      ctx.fillText(`#${obj.id}`, obj.cx+8, obj.cy-8);
+
+    } else if (mode === 'heatmap') {
+      ctx.beginPath();
+      ctx.arc(obj.cx, obj.cy, 4, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.fill();
+    }
+
+    const scanLine = ((Date.now()/8) % (obj.h+16|16));
+    ctx.fillStyle = 'rgba(0,255,136,0.06)';
+    ctx.fillRect(obj.x-8, obj.y-8+scanLine, obj.w+16, 2);
+  }
+
+  if (mode === 'heatmap') {
+    ctx.globalAlpha = 0.5;
+    ctx.drawImage(heatCanvas, 0, 0);
+    ctx.globalAlpha = 1;
+  }
+
+  document.getElementById('obj-count').textContent = trackedObjects.filter(o=>Date.now()-o.lastSeen<300).length;
+}
+
+let lastFrameTime = 0;
+function loop(ts=0) {
+  if (!running || paused) return;
+  animFrame = requestAnimationFrame(loop);
+  framesSinceCheck++;
+  const now = performance.now();
+  if (now - lastFpsTime > 500) {
+    const fps = Math.round(framesSinceCheck / ((now - lastFpsTime) / 1000));
+    document.getElementById('fps-val').textContent = fps;
+    framesSinceCheck = 0; lastFpsTime = now;
+  }
+  if (video.readyState < 2) return;
+  const vw = video.videoWidth || W, vh = video.videoHeight || H;
+  diffCtx.drawImage(video, 0, 0, vw, vh);
+  const imageData = diffCtx.getImageData(0, 0, vw, vh);
+  let diffData = computeDiff(imageData);
+  if (!diffData) return;
+  const eroded = erode(diffData, vw, vh);
+  const diffImg = new ImageData(eroded, vw, vh);
+  diffCtx.putImageData(diffImg, 0, 0);
+  const blobs = findBlobs(eroded, vw, vh);
+  matchObjects(blobs);
+  drawResults(blobs);
+}
+
+document.getElementById('btn-start').onclick = startCamera;
+document.getElementById('btn-start2').onclick = startCamera;
+
+document.getElementById('btn-pause').onclick = function() {
+  if (!running) return;
+  paused = !paused;
+  this.textContent = paused ? 'Resume' : 'Pause';
+  this.classList.toggle('active', paused);
+  if (!paused) loop();
+};
+
+document.getElementById('btn-mode').onclick = function() {
+  const modes = ['box','dot','heatmap'];
+  mode = modes[(modes.indexOf(mode)+1)%3];
+  this.textContent = 'Mode: ' + mode.charAt(0).toUpperCase()+mode.slice(1);
+  document.getElementById('mode-label').textContent = mode.toUpperCase();
+  if (mode === 'heatmap' && heatCtx) heatCtx.clearRect(0,0,heatCanvas.width,heatCanvas.height);
+  addLog('Mode: ' + mode);
+};
+
+document.getElementById('btn-trails').onclick = function() {
+  showTrails = !showTrails;
+  this.textContent = 'Trails: ' + (showTrails?'On':'Off');
+  this.classList.toggle('active', showTrails);
+  if (!showTrails && trailCtx) trailCtx.clearRect(0,0,trailCanvas.width,trailCanvas.height);
+};
+
+document.getElementById('btn-reset').onclick = function() {
+  trackedObjects = [];
+  objectIdCounter = 0;
+  prevFrame = null;
+  if (trailCtx) trailCtx.clearRect(0,0,trailCanvas.width,trailCanvas.height);
+  if (heatCtx) heatCtx.clearRect(0,0,heatCanvas.width,heatCanvas.height);
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+  addLog('Reset — tracking cleared');
+};
+
+document.getElementById('sens').oninput = function() {
+  sensitivity = +this.value;
+  document.getElementById('sens-label').textContent = sensitivity;
+};
+</script>
+</body>
+</html>
